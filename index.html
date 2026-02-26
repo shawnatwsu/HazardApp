@@ -709,6 +709,18 @@
 
   <script>
     // ─────────────────────────────────────────────────────────────────────────────
+    // 0. API CONFIG — GitHub Pages static deployment (no API keys needed!)
+    //    All data sources are free and keyless:
+    //    - Open-Meteo for weather (free, no key)
+    //    - NASA FIRMS for fire data (public key)
+    //    - NWS for weather alerts (free, no key)
+    //    - Nominatim for geocoding (free, no key)
+    // ─────────────────────────────────────────────────────────────────────────────
+    const API_KEYS = {
+      nasaFirms: '5c34e7394c85b3e51634e51ac0eebf73'
+    };
+
+    // ─────────────────────────────────────────────────────────────────────────────
     // 1. Initialize map with auto-refresh functionality
     // ─────────────────────────────────────────────────────────────────────────────
     const map = L.map("map", {
@@ -734,7 +746,7 @@
     // Add standard OpenStreetMap tiles
     L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
       maxZoom: 19,
-      attribution: '© OpenStreetMap contributors | Data: NASA FIRMS, OpenWeatherMap, NOAA NWS, Google Maps'
+      attribution: '© OpenStreetMap contributors | Data: NASA FIRMS, Open-Meteo, NOAA NWS, Nominatim'
     }).addTo(map);
 
     // Simple US-focused map without complex boundary loading
@@ -955,39 +967,97 @@
       // Show loading
       setLoading(true);
 
-      const proxyUrl = `/api/weather?lat=${lat}&lon=${lon}`;
-
       try {
-        console.log("Fetching weather data for:", lat, lon);
-        
-        const response = await fetch(proxyUrl);
+        // Open-Meteo: 100% free, no API key, full weather + air quality
+        const weatherUrl = `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}`
+          + `&current=temperature_2m,relative_humidity_2m,wind_speed_10m,wind_gusts_10m,cloud_cover,visibility,surface_pressure,precipitation,snowfall`
+          + `&daily=temperature_2m_max,temperature_2m_min,uv_index_max`
+          + `&temperature_unit=fahrenheit&wind_speed_unit=mph&precipitation_unit=mm&timezone=auto`;
 
-        if (!response.ok) {
-          // If API fails (likely quota exceeded), show demonstration data
-          if (response.status === 500 || response.status === 401) {
-            console.log("API quota likely exceeded, showing demo data");
-            setLoading(false);
-            return generateDemoData(lat, lon);
-          }
-          throw new Error(`API request failed: ${response.status}`);
+        const airUrl = `https://air-quality-api.open-meteo.com/v1/air-quality?latitude=${lat}&longitude=${lon}`
+          + `&current=pm2_5,nitrogen_dioxide`;
+
+        const [weatherRes, airRes] = await Promise.all([
+          fetch(weatherUrl),
+          fetch(airUrl).catch(() => null)
+        ]);
+
+        if (!weatherRes.ok) throw new Error(`Open-Meteo error: ${weatherRes.status}`);
+
+        const weather = await weatherRes.json();
+        const airData = airRes && airRes.ok ? await airRes.json() : null;
+
+        const cur = weather.current;
+        const daily = weather.daily;
+
+        const temp_f = cur.temperature_2m;
+        const humidity = cur.relative_humidity_2m;
+        const wind_speed_mph = cur.wind_speed_10m;
+        const wind_gusts_mph = cur.wind_gusts_10m || 0;
+        const cloud_cov = cur.cloud_cover;
+        const visibility_m = cur.visibility || 10000;
+        const visibility_miles = visibility_m * 0.000621371;
+        const pressure = cur.surface_pressure;
+        const precip = cur.precipitation || 0;
+        const snowfall = cur.snowfall || 0;
+
+        const uv_index = daily && daily.uv_index_max ? daily.uv_index_max[0] : 0;
+        const temp_max = daily && daily.temperature_2m_max ? daily.temperature_2m_max[0] : temp_f;
+        const temp_min = daily && daily.temperature_2m_min ? daily.temperature_2m_min[0] : temp_f;
+
+        let pm25 = 10;
+        let components = {};
+        if (airData && airData.current) {
+          pm25 = airData.current.pm2_5 || 10;
+          components = { no2: airData.current.nitrogen_dioxide || 0 };
         }
 
-        const data = await response.json();
-        setLoading(false);
-        
-        console.log("API Response:", data);
-        console.log("Mapped data:", { 
-          hi: data.heat_index, 
-          pm25: data.pm25, 
-          uv: data.uv_index, 
-          wind: data.wind_speed, 
-          visibility: data.visibility 
-        });
+        // Heat index (NOAA Rothfusz regression)
+        let heat_index = temp_f;
+        if (temp_f >= 80) {
+          const T = temp_f, R = humidity;
+          heat_index = -42.379 + 2.04901523*T + 10.14333127*R - 0.22475541*T*R -
+            6.83783e-3*T*T - 5.481717e-2*R*R + 1.22874e-3*T*T*R +
+            8.5282e-4*T*R*R - 1.99e-6*T*T*R*R;
+          if (R < 13 && T >= 80 && T <= 112) {
+            heat_index -= ((13-R)/4)*Math.pow((17-Math.abs(T-95))/17, 0.5);
+          } else if (R > 85 && T >= 80 && T <= 87) {
+            heat_index += ((R-85)/10)*((87-T)/5);
+          }
+        }
 
-        return data;
+        // Fire risk
+        let fire_risk = 0;
+        if (temp_f >= 90) fire_risk += 3; else if (temp_f >= 80) fire_risk += 2; else if (temp_f >= 70) fire_risk += 1;
+        if (humidity <= 20) fire_risk += 4; else if (humidity <= 30) fire_risk += 3; else if (humidity <= 40) fire_risk += 2; else if (humidity <= 50) fire_risk += 1;
+        if (wind_speed_mph >= 25) fire_risk += 3; else if (wind_speed_mph >= 15) fire_risk += 2; else if (wind_speed_mph >= 10) fire_risk += 1;
+        fire_risk = Math.min(fire_risk, 10);
+
+        setLoading(false);
+
+        return {
+          temperature: Math.round(temp_f * 10) / 10,
+          temp_max: Math.round(temp_max * 10) / 10,
+          temp_min: Math.round(temp_min * 10) / 10,
+          humidity: humidity,
+          heat_index: Math.round(heat_index * 1000) / 1000,
+          uv_index: uv_index,
+          pm25: pm25,
+          wind_speed: Math.round(wind_speed_mph * 10) / 10,
+          wind_gusts: Math.round(wind_gusts_mph * 10) / 10,
+          visibility: Math.round(visibility_miles * 10) / 10,
+          precipitation: precip,
+          cloud_cover: cloud_cov,
+          pressure: pressure,
+          snow_depth: snowfall,
+          no2: components.no2 || 0,
+          fire_risk: fire_risk,
+          soil_moisture: 0
+        };
+
       } catch (err) {
         setLoading(false);
-        console.log("API unavailable, showing demo data");
+        console.log("API unavailable, showing demo data:", err);
         return generateDemoData(lat, lon);
       }
     }
@@ -1169,33 +1239,123 @@
     // Storm warning data loading and display
     async function loadStormWarnings() {
       try {
-        console.log("Loading severe weather warnings...");
-        const response = await fetch('/api/storms');
+        console.log("Loading NWS alerts directly...");
+
+        const nwsUrl = "https://api.weather.gov/alerts/active?status=actual&message_type=alert";
+        const response = await fetch(nwsUrl, {
+          headers: {
+            'User-Agent': '(EnvironmentalSafetyDashboard, admin@example.com)',
+            'Accept': 'application/geo+json'
+          }
+        });
         
         if (!response.ok) {
-          console.log(`Storm API error: ${response.status} ${response.statusText}`);
+          console.log(`NWS API error: ${response.status}`);
           return;
         }
         
-        const stormData = await response.json();
-        console.log("Storm warnings received:", stormData);
+        const data = await response.json();
         
         // Clear existing storm markers
         stormMarkers.forEach(marker => {
-          if (marker && map.hasLayer && map.hasLayer(marker)) {
-            map.removeLayer(marker);
-          }
+          if (marker && map.hasLayer && map.hasLayer(marker)) map.removeLayer(marker);
         });
         stormMarkers = [];
-        
-        if (stormData.warnings && stormData.warnings.length > 0) {
-          displayStormMarkers(stormData.warnings);
-        } else {
-          console.log("No active severe weather warnings");
+
+        if (!data.features || data.features.length === 0) {
+          console.log("No active NWS alerts");
+          return;
+        }
+
+        // Filter and process alerts (same logic as server.py)
+        const allWarnings = [];
+
+        data.features.forEach(alert => {
+          const properties = alert.properties || {};
+          const geometry = alert.geometry;
+          const event = properties.event || '';
+          const severity = properties.severity || 'Unknown';
+          const urgency = properties.urgency || 'Unknown';
+          const certainty = properties.certainty || 'Unknown';
+          const headline = properties.headline || '';
+          const description = properties.description || '';
+          const instruction = properties.instruction || '';
+          const areas = properties.areaDesc || '';
+
+          // Skip test alerts
+          if (['test','practice','exercise'].some(w => event.toLowerCase().includes(w))) return;
+
+          let includeAlert = false;
+          let displayGeometry = geometry;
+
+          if (geometry && geometry.coordinates) {
+            const coords = geometry.coordinates;
+            if (coords && coords.length > 0) {
+              let sampleCoord;
+              if (Array.isArray(coords[0]) && Array.isArray(coords[0][0])) {
+                sampleCoord = coords[0][0];
+              } else if (Array.isArray(coords[0])) {
+                sampleCoord = coords[0];
+              } else {
+                sampleCoord = coords;
+              }
+              if (sampleCoord.length >= 2) {
+                const lng = sampleCoord[0], lat = sampleCoord[1];
+                if (lat >= 20 && lat <= 50 && lng >= -130 && lng <= -60) includeAlert = true;
+              }
+            }
+          } else if (areas) {
+            const lowerAreas = areas.toLowerCase();
+            const usStates = ['washington','oregon','california','nevada','arizona','utah','idaho',
+              'montana','wyoming','colorado','new mexico','north dakota','south dakota',
+              'nebraska','kansas','oklahoma','texas','minnesota','iowa','missouri',
+              'arkansas','louisiana','wisconsin','illinois','mississippi','alabama',
+              'tennessee','kentucky','indiana','michigan','ohio','west virginia',
+              'virginia','north carolina','south carolina','georgia','florida',
+              'maine','new hampshire','vermont','massachusetts','rhode island',
+              'connecticut','new york','pennsylvania','new jersey','delaware',
+              'maryland','columbia'];
+            const excluded = ['alaska','hawaii','puerto rico','virgin islands','guam','samoa'];
+
+            if (usStates.some(s => lowerAreas.includes(s)) && !excluded.some(e => lowerAreas.includes(e))) {
+              includeAlert = true;
+              let approxCoords = null;
+              if (['columbia river','portland','willamette','tualatin','vancouver metro','clackamas'].some(t => lowerAreas.includes(t))) approxCoords = [-122.68, 45.52];
+              else if (['seattle','puget sound','king county'].some(t => lowerAreas.includes(t))) approxCoords = [-122.33, 47.61];
+              else if (['spokane',"coeur d'alene",'northern panhandle'].some(t => lowerAreas.includes(t))) approxCoords = [-117.43, 47.66];
+              else if (['yakima','kittitas','wenatchee','chelan'].some(t => lowerAreas.includes(t))) approxCoords = [-120.51, 46.60];
+              else if (['el paso','hudspeth'].some(t => lowerAreas.includes(t))) approxCoords = [-106.49, 31.76];
+              else if (['brewster','terrell','chisos'].some(t => lowerAreas.includes(t))) approxCoords = [-103.25, 30.25];
+              else if (lowerAreas.includes('texas')) approxCoords = [-99.25, 31.25];
+              else if (lowerAreas.includes('washington') || lowerAreas.includes('okanogan')) approxCoords = [-120.84, 47.04];
+              else if (lowerAreas.includes('oregon') || lowerAreas.includes('blue mountains')) approxCoords = [-123.03, 44.93];
+              else if (lowerAreas.includes('idaho') || lowerAreas.includes('lewiston')) approxCoords = [-114.74, 44.07];
+
+              if (approxCoords) {
+                displayGeometry = { type: 'Point', coordinates: approxCoords };
+              } else {
+                displayGeometry = { type: 'Point', coordinates: [-120.0, 45.0] };
+              }
+            }
+          }
+
+          if (includeAlert) {
+            allWarnings.push({
+              properties: { event, severity, urgency, certainty, headline, description, instruction, areas,
+                effective: properties.effective, expires: properties.expires },
+              geometry: displayGeometry
+            });
+          }
+        });
+
+        console.log(`Filtered ${allWarnings.length} NWS alerts from ${data.features.length} total`);
+
+        if (allWarnings.length > 0) {
+          displayStormMarkers(allWarnings);
         }
         
       } catch (error) {
-        console.error("Error loading storm warnings:", error);
+        console.error("Error loading NWS alerts:", error);
       }
     }
     
@@ -1385,81 +1545,173 @@
     async function loadFireHazards() {
       try {
         const now = Date.now();
-        
-        // Use cached data if available and recent
+
+        // Use cached markers if recent
         if (cachedFireData && (now - lastFireDataFetch) < FIRE_CACHE_DURATION) {
           displayFireMarkers(cachedFireData);
           return;
         }
-        
-        console.log("Requesting fire data from server...");
-        const response = await fetch('/api/fires');
-        
-        if (!response.ok) {
-          console.log(`Fire API error: ${response.status} ${response.statusText}`);
-          // Keep existing markers if API fails
-          if (cachedFireData) {
-            console.log("Using cached fire data due to API error");
-            displayFireMarkers(cachedFireData);
+
+        console.log("Loading NASA FIRMS fire data...");
+
+        // ── Primary: FIRMS WMS tile layer ──────────────────────────────────
+        // The FIRMS CSV/JSON API does NOT support CORS from browsers.
+        // WMS is the official way to display FIRMS data on web maps.
+        // It renders fire pixels directly as map tiles — fast & reliable.
+        addFirmsWMSLayers();
+
+        // ── Secondary: try CSV API for clickable marker details ────────────
+        // This may fail due to CORS, which is fine — WMS still shows fires.
+        try {
+          const firmsUrl = `https://firms.modaps.eosdis.nasa.gov/api/area/csv/${API_KEYS.nasaFirms}/VIIRS_NOAA20_NRT/-130,20,-60,50/2`;
+          const response = await fetch(firmsUrl);
+
+          if (response.ok) {
+            const csvText = await response.text();
+            const fires = parseFirmsCSV(csvText);
+
+            if (fires.length > 0) {
+              const fireData = { fires, count: fires.length, source: 'NASA FIRMS' };
+              cachedFireData = fireData;
+              lastFireDataFetch = now;
+              displayFireMarkers(fireData);
+              console.log(`Also loaded ${fires.length} clickable fire markers from CSV API`);
+            }
           }
-          return;
+        } catch (csvErr) {
+          // Expected on GitHub Pages — CORS blocks CSV API. WMS still works.
+          console.log("FIRMS CSV API blocked by CORS (expected on static hosting). WMS layer active.");
         }
-        
-        const fireData = await response.json();
-        console.log("Fire data response:", fireData);
-        
-        if (!fireData.fires || fireData.fires.length === 0) {
-          console.log("No active fires detected in response");
-          // Keep existing markers if no new data
-          if (cachedFireData) {
-            displayFireMarkers(cachedFireData);
-          }
-          return;
-        }
-        
-        // Cache successful fire data
-        cachedFireData = fireData;
-        lastFireDataFetch = now;
-        
-        console.log(`Loading ${fireData.count} active fires from NASA satellite data`);
-        displayFireMarkers(fireData);
-        
+
       } catch (error) {
-        console.log("Fire data service unavailable");
-        // Keep existing markers on error
-        if (cachedFireData) {
-          displayFireMarkers(cachedFireData);
+        console.log("Fire data error:", error);
+        // Ensure WMS is still showing
+        addFirmsWMSLayers();
+      }
+    }
+
+    // Parse FIRMS CSV — filters to high & nominal confidence (excludes low = lights/flares)
+    function parseFirmsCSV(csvText) {
+      const lines = csvText.trim().split('\n');
+      if (lines.length < 2) return [];
+
+      const headers = lines[0].split(',').map(h => h.trim());
+      const fires = [];
+
+      for (let i = 1; i < lines.length; i++) {
+        const values = lines[i].split(',').map(v => v.trim());
+        if (values.length < headers.length) continue;
+        const row = {};
+        headers.forEach((h, idx) => row[h] = values[idx]);
+
+        const lat = parseFloat(row.latitude);
+        const lon = parseFloat(row.longitude);
+        const conf = (row.confidence || '').toLowerCase();
+
+        // ── CONFIDENCE FILTER ──────────────────────────────────────────
+        // h / high   = high certainty real fire
+        // n / nominal = probable fire
+        // l / low    = low confidence — often industrial lights, gas flares
+        // We ONLY show high + nominal (real fires), skip low (lights).
+        const isRealFire = (conf === 'h' || conf === 'n' || conf === 'high' || conf === 'nominal');
+
+        if (!isNaN(lat) && !isNaN(lon) && isRealFire &&
+            lat >= 25 && lat <= 49 && lon >= -125 && lon <= -66) {
+          fires.push({
+            latitude: lat,
+            longitude: lon,
+            confidence: (conf === 'h' || conf === 'high') ? 'High' : 'Nominal',
+            brightness: parseFloat(row.bright_ti4 || row.bright_ti5 || row.brightness) || null,
+            frp: parseFloat(row.frp) || null,
+            acq_date: row.acq_date || '',
+            acq_time: row.acq_time || ''
+          });
         }
       }
+
+      // Deduplicate nearby detections (~1km)
+      const seen = new Set();
+      return fires.filter(f => {
+        const key = `${f.latitude.toFixed(2)},${f.longitude.toFixed(2)}`;
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      });
+    }
+
+    // ── FIRMS WMS tile layers ──────────────────────────────────────────────
+    // These render fire detections as colored pixels directly on the map.
+    // Works from any browser — no CORS issues since it's a standard tile service.
+    let firmsWMSLayers = [];
+
+    function addFirmsWMSLayers() {
+      if (firmsWMSLayers.length > 0) return; // Already added
+
+      console.log("Adding FIRMS WMS fire tile layers");
+
+      // Show fires from multiple VIIRS satellites for best coverage
+      // Each layer shows recent fire detections as red/orange pixels
+      const layerConfigs = [
+        { layer: 'fires_viirs_noaa20_nrt', label: 'NOAA-20 VIIRS' },
+        { layer: 'fires_viirs_noaa21_nrt', label: 'NOAA-21 VIIRS' }
+      ];
+
+      layerConfigs.forEach(cfg => {
+        const wmsLayer = L.tileLayer.wms(
+          `https://firms.modaps.eosdis.nasa.gov/mapserver/wms/fires/${API_KEYS.nasaFirms}/`,
+          {
+            layers: cfg.layer,
+            format: 'image/png',
+            transparent: true,
+            opacity: 0.85,
+            maxZoom: 14,
+            attribution: `Fire: NASA FIRMS ${cfg.label}`
+          }
+        ).addTo(map);
+        firmsWMSLayers.push(wmsLayer);
+      });
+
+      console.log("FIRMS WMS layers added — fires should now be visible on map");
+    }
+
+    function removeFirmsWMSLayers() {
+      firmsWMSLayers.forEach(layer => {
+        if (map.hasLayer(layer)) map.removeLayer(layer);
+      });
+      firmsWMSLayers = [];
     }
 
     function displayFireMarkers(fireData) {
       // Clear existing fire markers
       fireMarkers.forEach(marker => map.removeLayer(marker));
       fireMarkers = [];
-      
-      // Add fire markers to map
+
+      // Add clickable fire markers on top of WMS tiles
       fireData.fires.forEach(fire => {
+        const isHigh = fire.confidence === 'High';
         const fireIcon = L.divIcon({
           className: 'fire-marker',
-          html: '🔥',
+          html: `<div style="font-size:${isHigh ? 18 : 14}px; filter: drop-shadow(0 1px 2px rgba(0,0,0,0.5));">${isHigh ? '🔥' : '🟠'}</div>`,
           iconSize: [20, 20],
           iconAnchor: [10, 10]
         });
-        
+
         const fireMarker = L.marker([fire.latitude, fire.longitude], { icon: fireIcon })
           .bindPopup(`
-            <div style="font-size: 12px;">
-              <strong>Active Fire Detected</strong><br>
-              Confidence: ${fire.confidence}<br>
-              Brightness: ${fire.brightness}K<br>
-              Date: ${fire.acq_date}<br>
-              Time: ${fire.acq_time}<br>
-              <em>Source: NASA FIRMS Satellite</em>
+            <div style="font-size: 12px; min-width: 160px;">
+              <strong style="color: ${isHigh ? '#d32f2f' : '#e65100'};">
+                ${isHigh ? '🔥 High Confidence Fire' : '🟠 Nominal Confidence Fire'}
+              </strong><br>
+              <hr style="margin: 4px 0; border: none; border-top: 1px solid #eee;">
+              ${fire.brightness ? `<b>Brightness:</b> ${fire.brightness.toFixed(1)} K<br>` : ''}
+              ${fire.frp ? `<b>Fire Power:</b> ${fire.frp.toFixed(1)} MW<br>` : ''}
+              ${fire.acq_date ? `<b>Detected:</b> ${fire.acq_date}` : ''}
+              ${fire.acq_time ? ` ${fire.acq_time} UTC` : ''}<br>
+              <em style="color:#888;">Source: NASA FIRMS VIIRS</em>
             </div>
           `)
           .addTo(map);
-        
+
         fireMarkers.push(fireMarker);
       });
     }
@@ -1525,19 +1777,15 @@
       if (fireMarkersVisible) {
         fireBtn.classList.add('active');
         // Show fire markers
-        fireMarkers.forEach(marker => {
-          if (marker && map.hasLayer && !map.hasLayer(marker)) {
-            map.addLayer(marker);
-          }
-        });
+        fireMarkers.forEach(m => { if (m && !map.hasLayer(m)) map.addLayer(m); });
+        // Show WMS layers
+        firmsWMSLayers.forEach(l => { if (l && !map.hasLayer(l)) map.addLayer(l); });
       } else {
         fireBtn.classList.remove('active');
         // Hide fire markers
-        fireMarkers.forEach(marker => {
-          if (marker && map.hasLayer && map.hasLayer(marker)) {
-            map.removeLayer(marker);
-          }
-        });
+        fireMarkers.forEach(m => { if (m && map.hasLayer(m)) map.removeLayer(m); });
+        // Hide WMS layers
+        firmsWMSLayers.forEach(l => { if (l && map.hasLayer(l)) map.removeLayer(l); });
       }
     }
     
@@ -1669,7 +1917,7 @@
       const mobileWeatherInfo = document.getElementById('mobile-weather-info');
       const mobileActivities = document.getElementById('mobile-activities');
       const currentStatus = document.getElementById('safetyStatus');
-      const currentTemp = document.getElementById('temperature');
+      const currentTemp = document.getElementById('currentTemp');
       const currentActivities = document.getElementById('goodForActivities');
       
       if (mobileStatus && currentStatus) {
@@ -1682,7 +1930,7 @@
         mobileWeatherInfo.innerHTML = `
           <div style="display: flex; justify-content: space-between; margin-bottom: 8px;">
             <span><strong>Temperature:</strong> ${currentTemp.textContent}</span>
-            <span><strong>AQI:</strong> ${document.getElementById('aqi').textContent}</span>
+            <span><strong>AQI:</strong> ${document.getElementById('pm25').textContent}</span>
           </div>
           <div style="display: flex; justify-content: space-between;">
             <span><strong>UV:</strong> ${document.getElementById('uv').textContent}</span>
@@ -1827,11 +2075,14 @@
         checkSevereWeatherAlerts(data, lat, lon);
         
         // Show wind gusts if significant
-        if (data.wind_gusts && data.wind_gusts > data.wind + 5) {
-          document.getElementById("windGusts").style.display = "inline";
-          document.getElementById("gustSpeed").textContent = data.wind_gusts.toFixed(1);
+        if (data.wind_gusts && data.wind_gusts > data.wind_speed + 5) {
+          const wgEl = document.getElementById("windGusts");
+          const gsEl = document.getElementById("gustSpeed");
+          if (wgEl) wgEl.style.display = "inline";
+          if (gsEl) gsEl.textContent = data.wind_gusts.toFixed(1);
         } else {
-          document.getElementById("windGusts").style.display = "none";
+          const wgEl = document.getElementById("windGusts");
+          if (wgEl) wgEl.style.display = "none";
         }
         
         // Update activity recommendations
@@ -2606,20 +2857,18 @@
       if (!query.trim()) return;
       
       try {
-        // Use Google Maps geocoding for more accurate results
-        const response = await fetch(`/api/geocode?address=${encodeURIComponent(query)}`);
-        const data = await response.json();
+        // Use Nominatim (OpenStreetMap) geocoding — free, no API key needed
+        const response = await fetch(`https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(query)}&countrycodes=us&limit=1`, {
+          headers: { 'User-Agent': 'SafetyDashboard/1.0' }
+        });
+        const results = await response.json();
         
-        if (data.results && data.results.length > 0) {
-          const location = data.results[0].geometry.location;
-          const lat = location.lat;
-          const lon = location.lng;
+        if (results.length > 0) {
+          const lat = parseFloat(results[0].lat);
+          const lon = parseFloat(results[0].lon);
           
-          // Check if location is within US bounds
           if (isWithinUSBoundaries(lat, lon)) {
-            // Update search box with formatted address
-            const formattedAddress = data.results[0].formatted_address;
-            document.getElementById("locationSearch").value = formattedAddress;
+            document.getElementById("locationSearch").value = results[0].display_name;
             updateAt(lat, lon);
           } else {
             alert("Location not found in US territory. Please search for US addresses or cities.");
@@ -2629,26 +2878,7 @@
         }
       } catch (error) {
         console.error("Geocoding error:", error);
-        // Fallback to Nominatim if Google API fails
-        try {
-          const response = await fetch(`https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(query)}&countrycodes=us&limit=1`);
-          const results = await response.json();
-          
-          if (results.length > 0) {
-            const lat = parseFloat(results[0].lat);
-            const lon = parseFloat(results[0].lon);
-            
-            if (isWithinUSBoundaries(lat, lon)) {
-              updateAt(lat, lon);
-            } else {
-              alert("Location not found in US territory. Please search for US addresses or cities.");
-            }
-          } else {
-            alert("Location not found. Please try a different search term.");
-          }
-        } catch (fallbackError) {
-          alert("Unable to search location. Please try again.");
-        }
+        alert("Unable to search location. Please try again.");
       }
     }
 
@@ -2706,17 +2936,14 @@
       }
       
       try {
-        // Use Google Places Autocomplete API
-        const response = await fetch(`/api/geocode?address=${encodeURIComponent(input)}`);
-        const data = await response.json();
+        // Use Nominatim for autocomplete
+        const response = await fetch(`https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(input)}&countrycodes=us&limit=5`, {
+          headers: { 'User-Agent': 'SafetyDashboard/1.0' }
+        });
+        const results = await response.json();
         
-        if (data.results && data.results.length > 0) {
-          // Format results to show multiple matches
-          const suggestions = data.results.slice(0, 5).map(result => ({
-            description: result.formatted_address,
-            place_id: result.place_id
-          }));
-          
+        if (results.length > 0) {
+          const suggestions = results.map(r => ({ description: r.display_name }));
           showAutocomplete(suggestions);
         } else {
           // Fallback to basic US cities autocomplete
@@ -2892,7 +3119,7 @@
       try {
         // Refresh all data sources
         await Promise.all([
-          loadFires(),
+          loadFireHazards(),
           currentLocation ? updateAt(currentLocation.lat, currentLocation.lng) : Promise.resolve(),
           stormMarkersVisible ? loadStormWarnings() : Promise.resolve()
         ]);
